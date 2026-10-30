@@ -5,6 +5,44 @@
 
 > README дополняется по мере реализации.
 
+## Запуск
+
+```bash
+cp .env.example .env    # при желании поменяйте пароль Grafana и порты
+docker compose up --build
+```
+
+| Сервис | Адрес на хосте | Переменная порта в `.env` |
+|---|---|---|
+| app-1 (`pod-1`, `dc-a`) | http://localhost:18081 | `APP1_PORT` |
+| app-2 (`pod-2`, `dc-b`) | http://localhost:18082 | `APP2_PORT` |
+| Prometheus | http://localhost:9090 | `PROMETHEUS_PORT` |
+| Grafana | http://localhost:3000 (логин/пароль из `.env`) | `GRAFANA_PORT` |
+
+Остановка: `docker compose down`.
+
+### Секреты
+
+Логин и пароль администратора Grafana задаются в `.env` (`GRAFANA_ADMIN_USER`, `GRAFANA_ADMIN_PASSWORD`).
+`.env` в `.gitignore`, в репозитории только `.env.example`. В compose переменные объявлены как
+`${VAR:?...}`: без `.env` стек не стартует с понятной ошибкой вместо тихого пароля по умолчанию.
+
+### Как устроен стек
+
+```
+app-1 ─┐  /metrics (pull каждые 5 с)
+app-2 ─┴──────────────▶ Prometheus ◀── PromQL ── Grafana (datasource uid=prometheus)
+```
+
+- `app-1` и `app-2` — один образ `highload-hw1-app:local` (собирается только в `app-1`, `app-2` его
+  переиспользует), разные `POD_ID`/`DATACENTER`; healthcheck — `/service -healthcheck`.
+- Prometheus (`prom/prometheus:v3.13.5`) скрейпит оба экземпляра по `static_configs`
+  (`deploy/prometheus/prometheus.yml`), `scrape_interval: 5s`.
+- Grafana (`grafana/grafana:13.2.5`) поднимает datasource из
+  `deploy/grafana/provisioning/datasources/prometheus.yml` с фиксированным `uid: prometheus` — на него
+  ссылается генерируемый дашборд; `editable: false`, так что из UI его не изменить.
+- Порядок старта: app → (healthy) → Prometheus → (healthy) → Grafana.
+
 ## Микросервис
 
 Хранилище — in-memory (`map` под `sync.RWMutex`).
@@ -109,7 +147,7 @@ p50 ≈ 14 мс, p95 ≈ 60 мс, p99 ≈ 92 мс.
 
 ```bash
 docker build -t highload-hw1-app .
-docker run --rm -p 8080:8080 -e POD_ID=pod-1 -e DATACENTER=dc-a -e FAILURE_RATE=0.05 -e LATENCY_MEAN=20ms highload-hw1-app
+docker run --rm -p 18080:8080 -e POD_ID=pod-1 -e DATACENTER=dc-a -e FAILURE_RATE=0.05 -e LATENCY_MEAN=20ms highload-hw1-app
 ```
 
 В образе нет `curl`/`wget`, поэтому healthcheck выполняет сам бинарник: `/service -healthcheck` делает
@@ -123,4 +161,5 @@ cmd/app/           точка входа сервиса
 internal/store/    in-memory хранилище
 internal/api/      HTTP-хендлеры
 internal/metrics/  middleware с метриками, список ручек
+deploy/            конфиги Prometheus и provisioning Grafana
 ```
