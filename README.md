@@ -3,14 +3,18 @@
 Учебный проект: CRUD-микросервис на Go с метриками золотых сигналов (latency, traffic, errors),
 автоматически генерируемым дашбордом Grafana и генератором нагрузки.
 
-> README дополняется по мере реализации.
-
 ## Запуск
 
 ```bash
 cp .env.example .env    # при желании поменяйте пароль Grafana и порты
-docker compose up --build
+docker compose up
 ```
+
+Образы приложения, `dashgen` и `loadgen` собираются при каждом `up` (`pull_policy: build`, с кешем —
+секунды), поэтому `--build` не нужен и Docker не пытается скачать их из реестра.
+
+Через 2–3 минуты на дашборде http://localhost:3000/d/items-service видна фоновая нагрузка ~30 RPS
+и ошибки 404/500.
 
 | Сервис | Адрес на хосте | Переменная порта в `.env` |
 |---|---|---|
@@ -19,7 +23,7 @@ docker compose up --build
 | Prometheus | http://localhost:9090 | `PROMETHEUS_PORT` |
 | Grafana | http://localhost:3000 (логин/пароль из `.env`) | `GRAFANA_PORT` |
 
-Остановка: `docker compose down`.
+Остановка: `docker compose down` (данные Prometheus не сохраняются между запусками — для стенда это не нужно).
 
 ### Секреты
 
@@ -30,8 +34,11 @@ docker compose up --build
 ### Как устроен стек
 
 ```
-app-1 ─┐  /metrics (pull каждые 5 с)
-app-2 ─┴──────────────▶ Prometheus ◀── PromQL ── Grafana (datasource uid=prometheus)
+            HTTP (~30 RPS)          /metrics (pull каждые 5 с)
+loadgen ──────────────▶ app-1 ─┐
+        ──────────────▶ app-2 ─┴──────────────▶ Prometheus ◀── PromQL ── Grafana
+                          ▲                                                 ▲
+                          └── GET /handlers ── dashgen ── POST dashboard ───┘
 ```
 
 - `app-1` и `app-2` — один образ `highload-hw1-app:local` (собирается только в `app-1`, `app-2` его
@@ -41,7 +48,9 @@ app-2 ─┴──────────────▶ Prometheus ◀── P
 - Grafana (`grafana/grafana:13.2.5`) поднимает datasource из
   `deploy/grafana/provisioning/datasources/prometheus.yml` с фиксированным `uid: prometheus` — на него
   ссылается генерируемый дашборд; `editable: false`, так что из UI его не изменить.
-- Порядок старта: app → (healthy) → Prometheus → (healthy) → Grafana.
+- `dashgen` — одноразовый генератор дашборда (см. ниже), `loadgen` — фоновая нагрузка (см. ниже).
+- Порядок старта:
+  app-1, app-2 (healthy) → Prometheus (healthy) → Grafana (healthy) → dashgen (exit 0) → loadgen.
 
 ## Микросервис
 
@@ -52,7 +61,8 @@ app-2 ─┴──────────────▶ Prometheus ◀── P
 | `POST /items` | создать запись | 201, 400 |
 | `GET /items/{id}` | получить запись | 200, 400, 404 |
 | `PUT /items/{id}` | обновить запись | 200, 400, 404 |
-| `GET /health` | готовность сервиса | 200 |
+
+Плюс на любой из них 500 с вероятностью `FAILURE_RATE` (см. «Искусственные сбои и задержка»).
 
 Тело запроса для `POST`/`PUT`:
 
@@ -166,6 +176,29 @@ method="GET", route="/items/{id}", datacenter=~"$datacenter", pod=~"$pod"
 
 Перегенерировать без перезапуска стека: `docker compose run --rm dashgen`.
 
+## Нагрузка (`cmd/loadgen`)
+
+Собственный генератор на Go. Стартует после `dashgen` (`condition: service_completed_successfully`) и
+healthcheck приложений, работает до остановки стека.
+
+- **Open-loop**: темп задаётся расписанием, а не ответами сервера — если сервис тормозит, нагрузка не
+  падает (как у реальных пользователей); число запросов в полёте ограничено 200.
+- **Плавный рост**: линейно от 1 RPS до `TARGET_RPS` за `RAMP_DURATION`, дальше постоянная нагрузка.
+- **Оба экземпляра**: запросы по очереди (round-robin) на `app-1` и `app-2`.
+- **Все ручки**: POST 20%, GET 50%, PUT 30%. У каждого экземпляра своё in-memory хранилище, поэтому
+  `loadgen` помнит созданные id отдельно для каждого экземпляра.
+- **Ошибки**: доля `NOT_FOUND_RATIO` GET/PUT идёт на заведомо несуществующие id → **404**;
+  `FAILURE_RATE` в приложении → **500**. Итого ~6% ошибок двух кодов (на стенде: 404 ≈ 2.8%, 500 ≈ 3%).
+- Раз в 10 с пишет в лог текущий RPS и распределение кодов: `docker compose logs -f loadgen`.
+
+| Переменная (`.env`) | По умолчанию | Назначение |
+|---|---|---|
+| `LOADGEN_TARGET_RPS` | `30` | целевой суммарный RPS на оба экземпляра |
+| `LOADGEN_RAMP_DURATION` | `2m` | время разгона |
+| `LOADGEN_NOT_FOUND_RATIO` | `0.05` | доля GET/PUT к несуществующим id |
+| `APP_FAILURE_RATE` | `0.03` | вероятность 500 в приложении |
+| `APP_LATENCY_MEAN` | `20ms` | средняя искусственная задержка в приложении |
+
 ## Локальный запуск без Docker
 
 ```bash
@@ -201,7 +234,16 @@ p50 ≈ 14 мс, p95 ≈ 60 мс, p99 ≈ 92 мс.
 
 Один `Dockerfile` для всех бинарников: multi-stage сборка (`golang:1.25.1-alpine` → статический бинарник
 с `CGO_ENABLED=0`) и минимальный runtime-образ `gcr.io/distroless/static-debian12:nonroot` (~18 МБ,
-без shell, не root). Какой бинарник собрать, задаёт build-arg `CMD` (по умолчанию `app`).
+без shell, не root). Какой бинарник собрать, задаёт build-arg `CMD` (`app`, `dashgen`, `loadgen`).
+
+Версии всех внешних образов зафиксированы:
+
+| Образ | Версия |
+|---|---|
+| `prom/prometheus` | `v3.13.5` (LTS-ветка 3.13) |
+| `grafana/grafana` | `13.2.5` |
+| `golang` (сборка) | `1.25.1-alpine` |
+| `gcr.io/distroless/static-debian12` | `nonroot@sha256:afa5c8…` — тег плавающий, поэтому закреплён digest |
 
 ```bash
 docker build -t highload-hw1-app .
@@ -217,6 +259,7 @@ docker run --rm -p 18080:8080 -e POD_ID=pod-1 -e DATACENTER=dc-a -e FAILURE_RATE
 ```
 cmd/app/            точка входа сервиса
 cmd/dashgen/        генератор дашборда (CLI)
+cmd/loadgen/        генератор нагрузки
 internal/store/     in-memory хранилище
 internal/api/       HTTP-хендлеры
 internal/metrics/   middleware с метриками, список ручек

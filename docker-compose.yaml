@@ -21,6 +21,7 @@ services:
       context: .
       args:
         CMD: app
+    pull_policy: build
     environment:
       <<: *app-env
       POD_ID: pod-1
@@ -89,6 +90,7 @@ services:
       args:
         CMD: dashgen
     image: highload-hw1-dashgen:local
+    pull_policy: build
     restart: "no"
     environment:
       APP_URLS: http://app-1:8080,http://app-2:8080
@@ -105,3 +107,24 @@ services:
         condition: service_healthy
       grafana:
         condition: service_healthy
+
+  loadgen:
+    build:
+      context: .
+      args:
+        CMD: loadgen
+    image: highload-hw1-loadgen:local
+    pull_policy: build
+    restart: unless-stopped
+    environment:
+      TARGETS: http://app-1:8080,http://app-2:8080
+      TARGET_RPS: ${LOADGEN_TARGET_RPS:-30}
+      RAMP_DURATION: ${LOADGEN_RAMP_DURATION:-2m}
+      NOT_FOUND_RATIO: ${LOADGEN_NOT_FOUND_RATIO:-0.05}
+    depends_on:
+      app-1:
+        condition: service_healthy
+      app-2:
+        condition: service_healthy
+      dashgen:
+        condition: service_completed_successfully
