@@ -141,6 +141,31 @@ method="GET", route="/items/{id}", datacenter=~"$datacenter", pod=~"$pod"
 - `$__rate_interval` — окно, которое Grafana подбирает не меньше 4× scrape interval, чтобы в `rate`
   всегда попадало достаточно точек.
 
+### Генератор дашборда (`cmd/dashgen`)
+
+Одноразовый контейнер в compose. Стартует, когда `app-1`, `app-2` и `grafana` прошли healthcheck
+(`depends_on: condition: service_healthy`), и завершается с кодом 0 после загрузки дашборда.
+
+1. `GET /handlers` у **каждого** экземпляра из `APP_URLS`, списки объединяются без дублей
+   (если на подах разные версии приложения, на дашборде будут все ручки).
+2. `dashboard.Build(...)` → `POST /api/dashboards/db` с basic auth администратора и `overwrite: true`:
+   повторный запуск обновляет тот же дашборд (фиксированный `uid`), а не создаёт копию.
+3. Сетевые ошибки и 5xx — повтор с экспоненциальной задержкой до `TIMEOUT`; 4xx (например, неверный
+   пароль) — сразу ошибка, повторять бессмысленно.
+
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `APP_URLS` | `http://app-1:8080` | экземпляры приложения через запятую |
+| `GRAFANA_URL` | `http://grafana:3000` | адрес Grafana |
+| `GRAFANA_USER`, `GRAFANA_PASSWORD` | — (обязательны) | учётные данные администратора, в compose берутся из `.env` |
+| `DATASOURCE_UID` | `prometheus` | uid datasource из provisioning |
+| `DASHBOARD_UID`, `DASHBOARD_TITLE` | `items-service`, `Items service: golden signals` | идентификатор и заголовок дашборда |
+| `TIMEOUT` | `2m` | общий таймаут с учётом повторов |
+
+Дашборд: http://localhost:3000/d/items-service
+
+Перегенерировать без перезапуска стека: `docker compose run --rm dashgen`.
+
 ## Локальный запуск без Docker
 
 ```bash
@@ -191,6 +216,7 @@ docker run --rm -p 18080:8080 -e POD_ID=pod-1 -e DATACENTER=dc-a -e FAILURE_RATE
 
 ```
 cmd/app/            точка входа сервиса
+cmd/dashgen/        генератор дашборда (CLI)
 internal/store/     in-memory хранилище
 internal/api/       HTTP-хендлеры
 internal/metrics/   middleware с метриками, список ручек
