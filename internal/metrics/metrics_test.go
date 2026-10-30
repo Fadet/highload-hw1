@@ -63,8 +63,6 @@ func TestDurationHistogram(t *testing.T) {
 	serve(mux, http.MethodGet, "/items/1")
 	serve(mux, http.MethodGet, "/items/404")
 
-	// Both requests share one series because the histogram has no code
-	// label; POST /items exists with zero observations thanks to pre-creation.
 	n, err := testutil.GatherAndCount(reg, RequestDurationName)
 	if err != nil {
 		t.Fatal(err)

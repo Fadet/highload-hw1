@@ -1,13 +1,16 @@
-// Command app runs the items microservice.
 package main
 
 import (
 	"context"
 	"errors"
+	"flag"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -21,12 +24,34 @@ import (
 )
 
 func main() {
+	healthcheck := flag.Bool("healthcheck", false, "probe GET /health of a running instance and exit")
+	flag.Parse()
+
 	addr := getenv("ADDR", ":8080")
+
+	if *healthcheck {
+		if err := probeHealth(addr); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if err := run(addr); err != nil {
+		slog.Error("fatal", "err", err)
+		os.Exit(1)
+	}
+}
+
+func run(addr string) error {
 	podID := getenv("POD_ID", "local")
 	datacenter := getenv("DATACENTER", "local")
 
-	// Every metric registered through this registerer gets pod and
-	// datacenter labels, so handlers do not need to know about them.
+	opts, err := loadOptions()
+	if err != nil {
+		return err
+	}
+
 	registry := prometheus.NewRegistry()
 	reg := prometheus.WrapRegistererWith(prometheus.Labels{
 		"pod":        podID,
@@ -39,11 +64,9 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// Business endpoints go through the instrumenting router.
 	router := metrics.NewRouter(reg, mux)
-	api.New(store.New()).Register(router)
+	api.New(store.New(), opts).Register(router)
 
-	// Service endpoints are registered directly and are not instrumented.
 	mux.HandleFunc("GET /health", api.Health)
 	mux.Handle("GET /metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
 	mux.Handle("GET /handlers", router.HandlersHandler())
@@ -57,22 +80,67 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	errCh := make(chan error, 1)
 	go func() {
-		slog.Info("starting server", "addr", addr, "pod", podID, "datacenter", datacenter)
+		slog.Info("starting server",
+			"addr", addr, "pod", podID, "datacenter", datacenter,
+			"failure_rate", opts.FailureRate, "latency_mean", opts.LatencyMean)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("server failed", "err", err)
-			os.Exit(1)
+			errCh <- err
 		}
 	}()
 
-	<-ctx.Done()
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+	}
 	slog.Info("shutting down")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		slog.Error("shutdown failed", "err", err)
+	return srv.Shutdown(shutdownCtx)
+}
+
+func loadOptions() (api.Options, error) {
+	var opts api.Options
+
+	if v := os.Getenv("FAILURE_RATE"); v != "" {
+		rate, err := strconv.ParseFloat(v, 64)
+		if err != nil || rate < 0 || rate > 1 {
+			return opts, fmt.Errorf("FAILURE_RATE must be a number in [0, 1], got %q", v)
+		}
+		opts.FailureRate = rate
 	}
+
+	if v := os.Getenv("LATENCY_MEAN"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			return opts, fmt.Errorf("LATENCY_MEAN must be a non-negative duration like 20ms, got %q", v)
+		}
+		opts.LatencyMean = d
+	}
+
+	return opts, nil
+}
+
+func probeHealth(addr string) error {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("parse ADDR %q: %w", addr, err)
+	}
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://127.0.0.1:" + port + "/health")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("health status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func getenv(key, fallback string) string {

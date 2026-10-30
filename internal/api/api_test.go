@@ -6,13 +6,14 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Fadet/highload-hw1/internal/store"
 )
 
 func newTestMux() *http.ServeMux {
 	mux := http.NewServeMux()
-	New(store.New()).Register(mux)
+	New(store.New(), Options{}).Register(mux)
 	mux.HandleFunc("GET /health", Health)
 	return mux
 }
@@ -70,6 +71,39 @@ func TestErrors(t *testing.T) {
 				t.Fatalf("got %d, want %d", rec.Code, tt.want)
 			}
 		})
+	}
+}
+
+func TestChaosFailureRate(t *testing.T) {
+	tests := []struct {
+		rate float64
+		want int
+	}{
+		{1, http.StatusInternalServerError},
+		{0, http.StatusCreated},
+	}
+	for _, tt := range tests {
+		mux := http.NewServeMux()
+		New(store.New(), Options{FailureRate: tt.rate}).Register(mux)
+		for range 20 {
+			if rec := do(t, mux, http.MethodPost, "/items", `{"name":"x"}`); rec.Code != tt.want {
+				t.Fatalf("rate %v: got %d, want %d", tt.rate, rec.Code, tt.want)
+			}
+		}
+	}
+}
+
+func TestChaosLatency(t *testing.T) {
+	mux := http.NewServeMux()
+	New(store.New(), Options{LatencyMean: 5 * time.Millisecond}).Register(mux)
+
+	const n = 50
+	start := time.Now()
+	for range n {
+		do(t, mux, http.MethodPost, "/items", `{"name":"x"}`)
+	}
+	if avg := time.Since(start) / n; avg < time.Millisecond {
+		t.Fatalf("average latency %v, expected injected delay", avg)
 	}
 }
 

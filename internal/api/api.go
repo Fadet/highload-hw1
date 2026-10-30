@@ -1,45 +1,65 @@
-// Package api contains HTTP handlers of the items service.
 package api
 
 import (
 	"encoding/json"
 	"errors"
+	"math/rand/v2"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/Fadet/highload-hw1/internal/store"
 )
 
-// Router is the minimal registration interface. *http.ServeMux satisfies it;
-// later it can be replaced by a wrapper that instruments every handler.
 type Router interface {
 	Handle(pattern string, handler http.Handler)
 }
 
-// ItemRequest is the request body for creating and updating items.
 type ItemRequest struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
 }
 
-// Handlers serves the business endpoints backed by a store.
+const maxLatency = 2 * time.Second
+
+type Options struct {
+	FailureRate float64
+	LatencyMean time.Duration
+}
+
 type Handlers struct {
 	store *store.Store
+	opts  Options
 }
 
-// New creates handlers backed by the given store.
-func New(s *store.Store) *Handlers {
-	return &Handlers{store: s}
+func New(s *store.Store, opts Options) *Handlers {
+	return &Handlers{store: s, opts: opts}
 }
 
-// Register adds the business endpoints to the router.
 func (h *Handlers) Register(r Router) {
-	r.Handle("POST /items", http.HandlerFunc(h.createItem))
-	r.Handle("GET /items/{id}", http.HandlerFunc(h.getItem))
-	r.Handle("PUT /items/{id}", http.HandlerFunc(h.updateItem))
+	r.Handle("POST /items", h.chaos(h.createItem))
+	r.Handle("GET /items/{id}", h.chaos(h.getItem))
+	r.Handle("PUT /items/{id}", h.chaos(h.updateItem))
 }
 
-// Health reports that the service is ready to accept requests.
+func (h *Handlers) chaos(next http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h.opts.LatencyMean > 0 {
+			delay := min(time.Duration(rand.ExpFloat64()*float64(h.opts.LatencyMean)), maxLatency)
+			select {
+			case <-time.After(delay):
+			case <-r.Context().Done():
+				return
+			}
+		}
+		if h.opts.FailureRate > 0 && rand.Float64() < h.opts.FailureRate {
+			writeError(w, http.StatusInternalServerError, "injected failure")
+			return
+		}
+		next(w, r)
+	})
+}
+
 func Health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

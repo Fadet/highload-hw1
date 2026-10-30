@@ -82,6 +82,39 @@ POD_ID=pod-1 DATACENTER=dc-a go run ./cmd/app   # слушает :8080, адре
 | `ADDR` | `:8080` | адрес HTTP-сервера |
 | `POD_ID` | `local` | лейбл `pod` |
 | `DATACENTER` | `local` | лейбл `datacenter` |
+| `FAILURE_RATE` | `0` | вероятность (0..1) искусственного ответа 500 на бизнес-ручках |
+| `LATENCY_MEAN` | `0` | средняя искусственная задержка (`20ms`), распределение экспоненциальное, максимум 2 с |
+
+### Искусственные сбои и задержка
+
+Бизнес-хендлеры обёрнуты в слой `chaos` (`internal/api`), который стоит **внутри** metrics-middleware,
+поэтому метрики видят искусственные 500 и задержки как настоящие:
+
+```
+запрос → metrics middleware → chaos (sleep, 500 с вероятностью FAILURE_RATE) → хендлер
+```
+
+- 500 — от `FAILURE_RATE`;
+- 404 — естественные, на запросы к несуществующим id (их генерирует нагрузочный инструмент).
+
+Задержка распределена экспоненциально: без неё in-memory ответ занимает микросекунды, все запросы
+попадают в первый бакет, и p50/p95/p99 сливаются в одну линию. При `LATENCY_MEAN=20ms` теоретически
+p50 ≈ 14 мс, p95 ≈ 60 мс, p99 ≈ 92 мс.
+
+## Docker
+
+Один `Dockerfile` для всех бинарников: multi-stage сборка (`golang:1.25.1-alpine` → статический бинарник
+с `CGO_ENABLED=0`) и минимальный runtime-образ `gcr.io/distroless/static-debian12:nonroot` (~18 МБ,
+без shell, не root). Какой бинарник собрать, задаёт build-arg `CMD` (по умолчанию `app`).
+
+```bash
+docker build -t highload-hw1-app .
+docker run --rm -p 8080:8080 -e POD_ID=pod-1 -e DATACENTER=dc-a -e FAILURE_RATE=0.05 -e LATENCY_MEAN=20ms highload-hw1-app
+```
+
+В образе нет `curl`/`wget`, поэтому healthcheck выполняет сам бинарник: `/service -healthcheck` делает
+`GET http://127.0.0.1:<порт>/health` и возвращает код выхода 0/1. Healthcheck нужно задавать
+в exec-форме (`["CMD", "/service", "-healthcheck"]`) — shell-форма в distroless не работает.
 
 ## Структура
 
