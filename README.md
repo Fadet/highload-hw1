@@ -108,6 +108,39 @@ histogram_quantile(0.99,
 Бакеты экспоненциальные: 0.5 мс × 2ⁿ, 14 штук (до ~4 с), — относительная погрешность примерно
 одинакова во всём диапазоне.
 
+## Дашборд
+
+JSON дашборда строится в `internal/dashboard` (чистая функция `Build(handlers, opts)` на Go-структурах,
+без SDK) по списку ручек, полученному в рантайме из `GET /handlers`. Ручки в коде генератора не
+перечислены: новая ручка в приложении после перезапуска стека получит свою строку на дашборде.
+
+- `editable: false` — дашборд нельзя редактировать из UI;
+- переменные `datacenter` и `pod` — `label_values(...)`, multi-select + All;
+  `pod` зависит от выбранных датацентров: `label_values(http_requests_total{datacenter=~"$datacenter"}, pod)`;
+- на каждую ручку — строка (row) `METHOD /route` и три панели.
+
+Селектор каждой панели (пример для `GET /items/{id}`):
+
+```
+method="GET", route="/items/{id}", datacenter=~"$datacenter", pod=~"$pod"
+```
+
+| Панель | PromQL |
+|---|---|
+| Latency (p50/p95/p99) | `histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{…}[$__rate_interval])))` |
+| RPS | `sum(rate(http_requests_total{…}[$__rate_interval]))` + разбивка `sum by (datacenter)` |
+| Errors by code | `sum by (code) (rate(http_requests_total{…, code=~"4..\|5.."}[$__rate_interval]))` |
+
+Почему так:
+
+- `rate` считается **до** `sum`: `rate` корректно обрабатывает сбросы счётчика при рестарте пода, а сумма
+  сброшенных счётчиков дала бы ложный провал;
+- для перцентилей суммируются бакеты по `le` (все остальные лейблы схлопываются), и только потом
+  `histogram_quantile` — так перцентиль считается по объединённому распределению выбранных подов;
+- `=~` нужен, потому что при multi-select/All Grafana подставляет в переменную регэксп `(dc-a|dc-b)`;
+- `$__rate_interval` — окно, которое Grafana подбирает не меньше 4× scrape interval, чтобы в `rate`
+  всегда попадало достаточно точек.
+
 ## Локальный запуск без Docker
 
 ```bash
@@ -157,9 +190,10 @@ docker run --rm -p 18080:8080 -e POD_ID=pod-1 -e DATACENTER=dc-a -e FAILURE_RATE
 ## Структура
 
 ```
-cmd/app/           точка входа сервиса
-internal/store/    in-memory хранилище
-internal/api/      HTTP-хендлеры
-internal/metrics/  middleware с метриками, список ручек
-deploy/            конфиги Prometheus и provisioning Grafana
+cmd/app/            точка входа сервиса
+internal/store/     in-memory хранилище
+internal/api/       HTTP-хендлеры
+internal/metrics/   middleware с метриками, список ручек
+internal/dashboard/ построение JSON дашборда Grafana
+deploy/             конфиги Prometheus и provisioning Grafana
 ```
